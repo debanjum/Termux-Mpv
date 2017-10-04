@@ -8,7 +8,6 @@ import time
 import tempfile
 import json
 import select
-import argparse
 
 
 class termuxmpv:
@@ -21,6 +20,7 @@ class termuxmpv:
         self.pause = False
         self.q = []
         self.metadata = {}
+        self.message = ''
         self.initFifo()
         if not self.checkForSocket():
             self.createSocket()
@@ -38,10 +38,10 @@ class termuxmpv:
     def checkForSocket(self):
         prev = ""
         for arg in reversed(self.args):
-            if arg == "--input-ipc-server":
+            if arg == "--input-unix-socket":
                 self.sockpath = prev
                 return True
-            elif arg.startswith("--input-ipc-server="):
+            elif arg.startswith("--input-unix-socket="):
                 self.sockpath = arg.split("=")[1]
                 return True
 
@@ -57,7 +57,7 @@ class termuxmpv:
     def startProcess(self):
         prefix = os.environ["PREFIX"]
         program = "{}/bin/mpv".format(prefix)
-        self.mpvproc = subprocess.Popen([program, '--input-ipc-server', self.sockpath] + self.args, stdin=sys.stdin)
+        self.mpvproc = subprocess.Popen([program, '--input-unix-socket', self.sockpath] + self.args, stdin=sys.stdin)
 
     def createSocket(self):
         fd, self.sockpath = tempfile.mkstemp(prefix="mpv.")
@@ -103,6 +103,7 @@ class termuxmpv:
     def monitor(self):
         while self.isRunning():
             # time.sleep(1)
+            # read output from while buffer not empty
             b = True
             buf = b""
             while b:
@@ -114,6 +115,7 @@ class termuxmpv:
                     break
                 buf += b
             buf = buf.decode("utf-8", 'replace')
+            # split buffer output into commands
             newline = buf.find("\n")
             while newline >= 0:
                 message = buf[:newline + 1]
@@ -121,6 +123,8 @@ class termuxmpv:
                 newline = buf.find("\n")
 
                 self.processMessage(message)
+
+            # Read Android Notifications/Termux Events from Fifo
             command = ""
             while True:
                 part = os.read(self.fifo, 1024).decode("utf-8")
@@ -131,6 +135,7 @@ class termuxmpv:
                 self.sendCommand(command)
 
     def sendCommand(self, command):
+        '''React to Android Notifications/Termux Events'''
         command = command.strip()
         if command == "prev":
             self.sendMessage(["keypress", "<"], "keypress")
@@ -144,6 +149,7 @@ class termuxmpv:
             self.updateNotification()
 
     def sendMessage(self, message, msgprocessor):
+        '''Send commands to Mpv over IPC socket'''
         self.q.append(msgprocessor)
         data = {}
         data["command"] = message
@@ -161,15 +167,17 @@ class termuxmpv:
             data = data[size:]
 
     def processMessage(self, message='{"event":""}'):
+        '''Parse Mpv commands json, update notification and retrieve further information if required'''
         try:
             message = json.loads(message)
+            self.message = message
         except:
             pass
         if "event" in message:
             if message["event"] == "metadata-update" or self.first:
                 self.sendMessage(["get_property", "metadata"], "metadata")
             if message["event"] == "file-loaded" or self.first:
-                self.sendMessage(["get_property", "filename"], "filename")
+                self.sendMessage(["get_property", "media-title"], "media-title")
             if message["event"] == "pause":
                 self.pause = True
                 self.updateNotification()
@@ -181,8 +189,8 @@ class termuxmpv:
                 if self.q[0] == "metadata":
                     self.metadata = message["data"]
                     self.updateNotification()
-                if self.q[0] == "filename":
-                    self.filename = message["data"]
+                if self.q[0] == "media-title":
+                    self.media_title = message["data"]
                     self.updateNotification()
                 del self.q[0]
         elif "error" in message:
@@ -196,18 +204,19 @@ class termuxmpv:
             # pass
 
     def updateNotification(self):
+        '''Interaction Layer between Android Notification Bar and TermuxMpv'''
         # self.updatehook()
-        # padding="           "
+        padding = "         "
         # disable padding for now
-        padding = ""
+        # padding = "   "
         # playbutton = "{}⏸{}".format(padding,padding)
         # prevbutton = "{}⏮{}".format(padding,padding)
         # nextbutton = "{}⏭{}".format(padding,padding)
-        playbutton = "{}❙❙{}".format(padding, padding)
+        playbutton = "{} ❙❙ {}".format(padding, padding)
         prevbutton = "{}|◀◀{}".format(padding, padding)
         nextbutton = "{}▶▶|{}".format(padding, padding)
         if self.pause:
-            playbutton = "{} ▶ {}".format(padding, padding)
+            playbutton = "{}▶{}".format(padding, padding)
         metadata = {}
         for attr in ["album", "artist", "title"]:
             try:
@@ -218,14 +227,16 @@ class termuxmpv:
                 except KeyError:
                     metadata[attr] = "None"
         try:
-            filename = self.filename
+            media_title = self.media_title
         except AttributeError:
-            filename = "None"
+            media_title = "None"
 
         if metadata["title"] == "None":
-            title = filename
+            title = media_title
         else:
             title = metadata["title"]
+
+        # Create notification bar using Termux API, populate now playing metadata, attach fifo write actions to buttons
         command = [
             "termux-notification",
             "--id", self.notificationId,
@@ -246,7 +257,7 @@ class termuxmpv:
             "--button3-action", "echo 'next'> {}".format(self.fifoname),
             "--on-delete", "echo 'exit'>{}".format(self.fifoname),
         ]
-        output = subprocess.call(command)
+        subprocess.call(command)
 
 
 def main(args=None):
